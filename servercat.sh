@@ -41,8 +41,18 @@ fi
 
 # Header
 echo "============================================"
-echo "     ServerCat VPS Setup Script v1.0        "
+echo "     ServerCat VPS Setup Script v2.0        "
 echo "============================================"
+echo ""
+print_warning "This script will configure your VPS for ServerCat monitoring"
+print_warning "It will modify SSH configuration and firewall settings"
+echo ""
+read -p "Continue? (y/n): " -n 1 -r
+echo ""
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    print_status "Setup cancelled"
+    exit 0
+fi
 echo ""
 
 # Detect OS
@@ -60,18 +70,39 @@ print_status "Detected OS: $OS $VER"
 # Update system
 print_status "Updating system packages..."
 if command -v apt-get >/dev/null; then
-    apt-get update -y > /dev/null 2>&1
-    apt-get upgrade -y > /dev/null 2>&1
+    if apt-get update -y; then
+        print_status "Package lists updated"
+        print_status "Upgrading packages (this may take a while)..."
+        apt-get upgrade -y
+    else
+        print_error "Failed to update package lists"
+        exit 1
+    fi
 elif command -v yum >/dev/null; then
-    yum update -y > /dev/null 2>&1
+    if yum update -y; then
+        print_status "System updated"
+    else
+        print_error "Failed to update system"
+        exit 1
+    fi
 fi
 
 # Install required packages
 print_status "Installing required packages..."
 if command -v apt-get >/dev/null; then
-    apt-get install -y openssh-server fail2ban ufw sudo curl wget > /dev/null 2>&1
+    if apt-get install -y openssh-server fail2ban ufw sudo curl wget; then
+        print_status "Required packages installed"
+    else
+        print_error "Failed to install required packages"
+        exit 1
+    fi
 elif command -v yum >/dev/null; then
-    yum install -y openssh-server fail2ban firewalld sudo curl wget > /dev/null 2>&1
+    if yum install -y openssh-server fail2ban firewalld sudo curl wget; then
+        print_status "Required packages installed"
+    else
+        print_error "Failed to install required packages"
+        exit 1
+    fi
 fi
 
 # Ensure SSH is running
@@ -147,26 +178,24 @@ fi
 SSH_PORT=22
 print_status "SSH port locked to default: $SSH_PORT"
 
-# Apply security configurations
-# Use more robust sed patterns and backup important changes
-sed -i.bak 's/^[[:space:]]*#*[[:space:]]*PermitRootLogin.*/PermitRootLogin without-password/' $SSH_CONFIG
+# Apply security configurations for ServerCat
+print_status "Configuring SSH for ServerCat access..."
+
+# Configure SSH settings (all in one place to avoid conflicts)
+sed -i.bak 's/^[[:space:]]*#*[[:space:]]*PermitRootLogin.*/PermitRootLogin yes/' $SSH_CONFIG
 sed -i 's/^[[:space:]]*#*[[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication yes/' $SSH_CONFIG
 sed -i 's/^[[:space:]]*#*[[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' $SSH_CONFIG
 sed -i 's/^[[:space:]]*#*[[:space:]]*PermitEmptyPasswords.*/PermitEmptyPasswords no/' $SSH_CONFIG
 sed -i 's/^[[:space:]]*#*[[:space:]]*X11Forwarding.*/X11Forwarding no/' $SSH_CONFIG
 sed -i 's/^[[:space:]]*#*[[:space:]]*UsePAM.*/UsePAM yes/' $SSH_CONFIG
 
-# Configure SSH for direct root access
-print_status "Configuring SSH for direct root access..."
-
-# Enable root login with password for ServerCat
-sed -i 's/^[[:space:]]*#*[[:space:]]*PermitRootLogin.*/PermitRootLogin yes/' $SSH_CONFIG
-
-# Remove any AllowUsers restrictions to allow root login
-if grep -q "AllowUsers" $SSH_CONFIG; then
-    print_warning "Removing AllowUsers restrictions to enable root access"
-    sed -i '/^AllowUsers/d' $SSH_CONFIG
-    sed -i '/^# Allow ServerCat/d' $SSH_CONFIG
+# Check for AllowUsers restrictions and warn (but don't delete)
+if grep -q "^AllowUsers" $SSH_CONFIG; then
+    print_warning "Found AllowUsers restriction in SSH config"
+    print_warning "You may need to add 'root' to the AllowUsers line manually"
+    print_warning "Current AllowUsers line:"
+    grep "^AllowUsers" $SSH_CONFIG
+    print_warning "To enable root access, add 'root' to the AllowUsers line in $SSH_CONFIG"
 fi
 
 print_status "SSH security settings applied"
@@ -174,26 +203,50 @@ print_status "SSH security settings applied"
 # Configure firewall (idempotent)
 print_status "Configuring firewall..."
 if command -v ufw >/dev/null; then
+    # CRITICAL: Add SSH rule BEFORE enabling UFW to avoid lockout
     # Check if rule already exists
     if ! ufw status | grep -q "$SSH_PORT/tcp"; then
-        ufw allow $SSH_PORT/tcp > /dev/null 2>&1
-        print_status "UFW rule added for port $SSH_PORT"
+        print_status "Adding UFW rule for SSH port $SSH_PORT..."
+        if ufw allow $SSH_PORT/tcp; then
+            print_status "UFW rule added for port $SSH_PORT"
+        else
+            print_error "Failed to add UFW rule for port $SSH_PORT"
+            print_error "Aborting to prevent lockout"
+            exit 1
+        fi
     else
         print_status "UFW rule for port $SSH_PORT already exists"
     fi
+
+    # Verify the rule is properly configured before enabling
+    if ufw status | grep -q "$SSH_PORT/tcp.*ALLOW"; then
+        print_status "SSH port rule verified"
+    else
+        print_warning "Could not verify SSH rule - checking if already allowed..."
+    fi
+
     # Enable UFW if not already enabled
     if ! ufw status | grep -q "Status: active"; then
-        echo "y" | ufw enable > /dev/null 2>&1
-        print_status "UFW firewall enabled"
+        print_warning "Enabling UFW firewall..."
+        if echo "y" | ufw enable; then
+            print_status "UFW firewall enabled successfully"
+        else
+            print_error "Failed to enable UFW"
+            exit 1
+        fi
     else
         print_status "UFW firewall already active"
     fi
 elif command -v firewall-cmd >/dev/null; then
     # Check if port is already allowed
     if ! firewall-cmd --list-ports | grep -q "$SSH_PORT/tcp"; then
-        firewall-cmd --permanent --add-port=$SSH_PORT/tcp > /dev/null 2>&1
-        firewall-cmd --reload > /dev/null 2>&1
-        print_status "Firewalld configured for port $SSH_PORT"
+        print_status "Adding firewalld rule for SSH port $SSH_PORT..."
+        if firewall-cmd --permanent --add-port=$SSH_PORT/tcp && firewall-cmd --reload; then
+            print_status "Firewalld configured for port $SSH_PORT"
+        else
+            print_error "Failed to configure firewalld"
+            exit 1
+        fi
     else
         print_status "Firewalld already configured for port $SSH_PORT"
     fi
@@ -238,15 +291,45 @@ else
     print_warning "fail2ban not installed - skipping configuration"
 fi
 
+# Validate SSH configuration before restarting
+print_status "Validating SSH configuration..."
+if sshd -t 2>/dev/null; then
+    print_status "SSH configuration is valid"
+elif /usr/sbin/sshd -t 2>/dev/null; then
+    print_status "SSH configuration is valid"
+else
+    print_error "SSH configuration validation failed!"
+    print_error "Restoring backup configuration..."
+    if [ -f "${SSH_CONFIG}.bak" ]; then
+        cp "${SSH_CONFIG}.bak" "$SSH_CONFIG"
+        print_status "Backup restored"
+    fi
+    print_error "Please check $SSH_CONFIG for errors"
+    exit 1
+fi
+
 # Restart SSH service (using detected service name)
 print_status "Restarting SSH service..."
 if [ -n "$SSH_SERVICE" ]; then
-    systemctl restart $SSH_SERVICE
-    print_status "SSH service ($SSH_SERVICE) restarted"
+    if systemctl restart $SSH_SERVICE; then
+        print_status "SSH service ($SSH_SERVICE) restarted successfully"
+    else
+        print_error "Failed to restart SSH service!"
+        print_error "Restoring backup and retrying..."
+        if [ -f "${SSH_CONFIG}.bak" ]; then
+            cp "${SSH_CONFIG}.bak" "$SSH_CONFIG"
+            systemctl restart $SSH_SERVICE
+        fi
+        exit 1
+    fi
 else
     # Fallback to trying both
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd
-    print_status "SSH service restarted"
+    if systemctl restart ssh 2>/dev/null || systemctl restart sshd; then
+        print_status "SSH service restarted successfully"
+    else
+        print_error "Failed to restart SSH service!"
+        exit 1
+    fi
 fi
 
 # Get server IP
@@ -328,13 +411,34 @@ EOF
 echo ""
 cat $INFO_FILE
 
+# Verify SSH is still accessible
+echo ""
+print_status "Verifying SSH service is accessible..."
+if systemctl is-active --quiet $SSH_SERVICE && ss -tlnp | grep -q ":$SSH_PORT "; then
+    print_status "SSH service is running and listening on port $SSH_PORT"
+else
+    print_error "WARNING: SSH service may not be accessible!"
+    print_error "Check service status: systemctl status $SSH_SERVICE"
+fi
+
+# Test local SSH connection (non-blocking)
+print_status "Testing local SSH connection..."
+if timeout 5 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -p $SSH_PORT root@localhost exit 2>/dev/null; then
+    print_status "Local SSH connection successful!"
+elif [ $? -eq 255 ]; then
+    print_status "SSH is accessible (authentication required as expected)"
+else
+    print_warning "Could not verify SSH connection - manual testing recommended"
+fi
+
 # Final recommendations
 echo ""
 print_warning "IMPORTANT SECURITY NOTES:"
-print_warning "1. Save the password you just created - you'll need it for initial ServerCat connection"
-print_warning "2. Set up SSH key authentication as soon as possible"
-print_warning "3. After setting up keys, disable password authentication"
-print_warning "4. Consider setting up automated backups and monitoring"
+print_warning "1. Test SSH access from another terminal before closing this session!"
+print_warning "2. Save the root password - you'll need it for initial ServerCat connection"
+print_warning "3. Set up SSH key authentication as soon as possible"
+print_warning "4. After setting up keys, disable password authentication"
+print_warning "5. Consider setting up automated backups and monitoring"
 echo ""
 print_status "Setup information saved to: $INFO_FILE"
 print_status "Script completed successfully!"
