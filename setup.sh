@@ -5,6 +5,21 @@
 
 set -e
 
+# Cleanup function - removes SSH config entry if script fails
+cleanup() {
+    if [ $? -ne 0 ] && [ -n "$ALIAS_NAME" ] && [ -n "$SSH_CONFIG" ]; then
+        if grep -q "^Host $ALIAS_NAME$" "$SSH_CONFIG" 2>/dev/null; then
+            echo ""
+            echo -e "${YELLOW}[*]${NC} Cleaning up failed configuration..."
+            # Remove the failed SSH config entry
+            sed -i.bak "/^Host $ALIAS_NAME$/,/^$/d" "$SSH_CONFIG"
+            echo -e "${BLUE}[i]${NC} Removed incomplete SSH config entry for '$ALIAS_NAME'"
+        fi
+    fi
+}
+
+trap cleanup EXIT
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -87,6 +102,24 @@ if [ -z "$ALIAS_NAME" ]; then
     print_warning "No alias provided, using: $ALIAS_NAME"
 fi
 
+# Check if alias already exists and clean it up FIRST
+SSH_CONFIG="$HOME/.ssh/config"
+if grep -q "^Host $ALIAS_NAME$" "$SSH_CONFIG" 2>/dev/null; then
+    echo ""
+    print_warning "Alias '$ALIAS_NAME' already exists in SSH config"
+    print_info "This may be from a previous failed setup attempt"
+    read -p "Remove existing entry and start fresh? (Y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        # Remove existing entry (including all lines until next Host or EOF)
+        sed -i.bak "/^Host $ALIAS_NAME$/,/^Host /{ /^Host $ALIAS_NAME$/d; /^Host /!d; }" "$SSH_CONFIG"
+        print_status "Removed old entry"
+    else
+        print_warning "Setup cancelled - cannot proceed with existing alias"
+        exit 0
+    fi
+fi
+
 # Summary
 echo ""
 print_info "Configuration Summary:"
@@ -110,7 +143,8 @@ print_status "Copying SSH key to server..."
 print_warning "You will be prompted for the server password"
 echo ""
 
-if ssh-copy-id -i "$SSH_PUB_KEY" -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST"; then
+# Use StrictHostKeyChecking=accept-new to auto-accept new hosts (but not changed ones)
+if ssh-copy-id -i "$SSH_PUB_KEY" -o StrictHostKeyChecking=accept-new -o Port="$SERVER_PORT" "$SERVER_USER@$SERVER_HOST"; then
     print_status "SSH key copied successfully!"
 else
     print_error "Failed to copy SSH key to server"
@@ -118,32 +152,15 @@ else
 fi
 
 # Add to SSH config
-SSH_CONFIG="$HOME/.ssh/config"
 echo ""
 print_status "Adding server to SSH config..."
 
-# Check if alias already exists
-if grep -q "^Host $ALIAS_NAME$" "$SSH_CONFIG" 2>/dev/null; then
-    print_warning "Alias '$ALIAS_NAME' already exists in SSH config"
-    read -p "Overwrite existing entry? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # Remove existing entry (including all lines until next Host or EOF)
-        sed -i.bak "/^Host $ALIAS_NAME$/,/^Host /{ /^Host $ALIAS_NAME$/d; /^Host /!d; }" "$SSH_CONFIG"
-        print_status "Removed old entry"
-    else
-        print_warning "Skipping SSH config update"
-        SSH_CONFIG_UPDATED=false
-    fi
-fi
+# Ensure SSH config exists
+touch "$SSH_CONFIG"
+chmod 600 "$SSH_CONFIG"
 
-if [ "$SSH_CONFIG_UPDATED" != "false" ]; then
-    # Ensure SSH config exists
-    touch "$SSH_CONFIG"
-    chmod 600 "$SSH_CONFIG"
-
-    # Add new entry
-    cat << EOF >> "$SSH_CONFIG"
+# Add new entry
+cat << EOF >> "$SSH_CONFIG"
 
 Host $ALIAS_NAME
     HostName $SERVER_HOST
@@ -152,8 +169,7 @@ Host $ALIAS_NAME
     IdentityFile $SSH_KEY
 EOF
 
-    print_status "Server added to SSH config"
-fi
+print_status "Server added to SSH config"
 
 # Test connection
 echo ""
